@@ -2,6 +2,8 @@
 
 This Pi extension records local, append-only JSONL telemetry at `~/.pi/agent/telemetry/pi-usage.jsonl`.
 
+It exposes pure helpers in `metrics.ts` for cumulative input and output, cache reads, cache-hit rate, and AgentDiet contributions. The Status Bar extension uses those helpers to render Pi's footer.
+
 ## Install
 
 Clone this repository into Pi's user extension directory:

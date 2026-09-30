@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { collectMetrics } from "./index.ts";
+import { collectMetrics } from "./metrics.ts";
 
 const usage = (input, output, cost) => ({
   input,

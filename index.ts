@@ -1,55 +1,23 @@
-import type { AssistantMessage, Usage } from "@earendil-works/pi-ai";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import type { ExtensionAPI, ExtensionContext, SessionEntry, Theme } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import {
+	addMetrics,
+	collectMetrics,
+	createUsageTotals,
+	isTelemetryContribution,
+	type SessionMetrics,
+	type TelemetryContribution,
+} from "./metrics.ts";
 
 const TELEMETRY_EVENT = "telemetry:contribution";
 const CONTRIBUTION_ENTRY = "pi-telemetry:contribution";
 const SCHEMA_VERSION = 1;
 
-type UsageTotals = {
-	input: number;
-	output: number;
-	cacheRead: number;
-	cacheWrite: number;
-	cost: number;
-};
-
-/**
- * A model call or measured saving reported by another Pi extension.
- *
- * Emit it with `pi.events.emit("telemetry:contribution", contribution)`. `id` must
- * be unique for the contribution. Savings describe removed future input context, not
- * money saved, because a token only becomes billable if Pi would have sent it.
- */
-export interface TelemetryContribution {
-	id: string;
-	experiment: string;
-	timestamp?: string;
-	usage?: Usage;
-	savings?: { inputTokens: number };
-	metadata?: Record<string, boolean | number | string>;
-}
-
-type AgentDietRecord = {
-	tokensBefore?: number;
-	tokensAfter?: number;
-	track?: string;
-	usage?: Usage;
-};
-
-export type SessionMetrics = {
-	primary: UsageTotals;
-	experiments: UsageTotals;
-	total: UsageTotals;
-	agentDiet: {
-		events: number;
-		savedInputTokens: number;
-		reflectorCost: number;
-	};
-};
+export { collectMetrics } from "./metrics.ts";
+export type { SessionMetrics, TelemetryContribution } from "./metrics.ts";
 
 type TelemetrySnapshot = {
 	type: "session_snapshot";
@@ -70,67 +38,11 @@ type ContributionEvent = {
 
 type StoredEvent = TelemetrySnapshot | ContributionEvent;
 
-function emptyTotals(): UsageTotals {
-	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
-}
-
-function addUsage(totals: UsageTotals, usage: Usage | undefined): void {
-	if (!usage) return;
-	totals.input += finite(usage.input);
-	totals.output += finite(usage.output);
-	totals.cacheRead += finite(usage.cacheRead);
-	totals.cacheWrite += finite(usage.cacheWrite);
-	totals.cost += finite(usage.cost?.total);
-}
-
-function finite(value: unknown): number {
-	return typeof value === "number" && Number.isFinite(value) ? value : 0;
-}
-
-function totalOf(primary: UsageTotals, experiments: UsageTotals): UsageTotals {
-	return {
-		input: primary.input + experiments.input,
-		output: primary.output + experiments.output,
-		cacheRead: primary.cacheRead + experiments.cacheRead,
-		cacheWrite: primary.cacheWrite + experiments.cacheWrite,
-		cost: primary.cost + experiments.cost,
-	};
-}
-
-function isAssistant(entry: SessionEntry): entry is SessionEntry & { message: AssistantMessage } {
-	return entry.type === "message" && entry.message.role === "assistant";
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function isUsage(value: unknown): value is Usage {
-	if (!isRecord(value) || !isRecord(value.cost)) return false;
-	return [value.input, value.output, value.cacheRead, value.cacheWrite, value.totalTokens, value.cost.input, value.cost.output, value.cost.cacheRead, value.cost.cacheWrite, value.cost.total].every(
-		(item) => typeof item === "number" && Number.isFinite(item),
-	);
-}
-
-function isAgentDietRecord(value: unknown): value is AgentDietRecord {
-	if (!isRecord(value)) return false;
-	return (
-		(value.tokensBefore === undefined || typeof value.tokensBefore === "number") &&
-		(value.tokensAfter === undefined || typeof value.tokensAfter === "number") &&
-		(value.track === undefined || typeof value.track === "string") &&
-		(value.usage === undefined || isUsage(value.usage))
-	);
-}
-
-function isContribution(value: unknown): value is TelemetryContribution {
-	if (!isRecord(value) || typeof value.id !== "string" || value.id.length === 0 || typeof value.experiment !== "string" || value.experiment.length === 0) return false;
-	if (value.timestamp !== undefined && typeof value.timestamp !== "string") return false;
-	if (value.usage !== undefined && !isUsage(value.usage)) return false;
-	if (value.savings !== undefined && (!isRecord(value.savings) || typeof value.savings.inputTokens !== "number")) return false;
-	return value.metadata === undefined || (isRecord(value.metadata) && Object.values(value.metadata).every((item) => ["boolean", "number", "string"].includes(typeof item)));
-}
-
-function isTotals(value: unknown): value is UsageTotals {
+function isTotals(value: unknown): value is SessionMetrics["primary"] {
 	return isRecord(value) && [value.input, value.output, value.cacheRead, value.cacheWrite, value.cost].every((item) => typeof item === "number" && Number.isFinite(item));
 }
 
@@ -141,58 +53,8 @@ function isMetrics(value: unknown): value is SessionMetrics {
 
 function isStoredEvent(value: unknown): value is StoredEvent {
 	if (!isRecord(value) || typeof value.schemaVersion !== "number" || typeof value.timestamp !== "string" || typeof value.sessionId !== "string") return false;
-	if (value.type === "contribution") return isContribution(value.contribution);
+	if (value.type === "contribution") return isTelemetryContribution(value.contribution);
 	return value.type === "session_snapshot" && typeof value.cwd === "string" && isMetrics(value.metrics);
-}
-
-/** Compute exact Pi-reported usage plus experiment usage stored in the active branch. */
-export function collectMetrics(entries: readonly SessionEntry[]): SessionMetrics {
-	const primary = emptyTotals();
-	const experiments = emptyTotals();
-	let dietEvents = 0;
-	let dietSavedInputTokens = 0;
-	let dietReflectorCost = 0;
-
-	for (const entry of entries) {
-		if (isAssistant(entry)) {
-			addUsage(primary, entry.message.usage);
-			continue;
-		}
-		if (entry.type === "usage") {
-			addUsage(primary, entry.usage);
-			continue;
-		}
-		if (entry.type === "compaction" || entry.type === "branch_summary") {
-			addUsage(primary, entry.usage);
-			continue;
-		}
-		if (entry.type !== "custom") continue;
-
-		if (entry.customType === "agentdiet" && isAgentDietRecord(entry.data)) {
-			const record = entry.data;
-			const saved = finite(record.tokensBefore) - finite(record.tokensAfter);
-			dietEvents += 1;
-			dietSavedInputTokens += Math.max(0, saved);
-			addUsage(experiments, record.usage);
-			dietReflectorCost += finite(record.usage?.cost?.total);
-			continue;
-		}
-
-		if (entry.customType === CONTRIBUTION_ENTRY && isContribution(entry.data)) {
-			addUsage(experiments, entry.data.usage);
-		}
-	}
-
-	return {
-		primary,
-		experiments,
-		total: totalOf(primary, experiments),
-		agentDiet: {
-			events: dietEvents,
-			savedInputTokens: dietSavedInputTokens,
-			reflectorCost: dietReflectorCost,
-		},
-	};
 }
 
 function telemetryDir(): string {
@@ -265,8 +127,8 @@ function metricsLines(title: string, metrics: SessionMetrics): string[] {
 }
 
 function aggregate(snapshots: readonly TelemetrySnapshot[]): SessionMetrics {
-	const primary = emptyTotals();
-	const experiments = emptyTotals();
+	const primary = createUsageTotals();
+	const experiments = createUsageTotals();
 	let dietEvents = 0;
 	let dietSavedInputTokens = 0;
 	let dietReflectorCost = 0;
@@ -282,7 +144,7 @@ function aggregate(snapshots: readonly TelemetrySnapshot[]): SessionMetrics {
 	return {
 		primary,
 		experiments,
-		total: totalOf(primary, experiments),
+		total: addMetrics(primary, experiments),
 		agentDiet: { events: dietEvents, savedInputTokens: dietSavedInputTokens, reflectorCost: dietReflectorCost },
 	};
 }
@@ -347,14 +209,10 @@ export default function telemetry(pi: ExtensionAPI) {
 
 	pi.on("session_start", (_event, ctx) => {
 		currentSessionId = ctx.sessionManager.getSessionId();
-		const total = collectMetrics(ctx.sessionManager.getBranch()).total;
-		ctx.ui.setStatus("telemetry", `↑${formatNumber(total.input)} ↓${formatNumber(total.output)} ${formatCost(total.cost)}`);
 	});
 
 	pi.on("agent_settled", (_event, ctx) => {
 		persistSnapshot(ctx);
-		const total = collectMetrics(ctx.sessionManager.getBranch()).total;
-		ctx.ui.setStatus("telemetry", `↑${formatNumber(total.input)} ↓${formatNumber(total.output)} ${formatCost(total.cost)}`);
 	});
 
 	pi.on("session_shutdown", (_event, ctx) => {
@@ -363,7 +221,7 @@ export default function telemetry(pi: ExtensionAPI) {
 	});
 
 	pi.events.on(TELEMETRY_EVENT, (raw) => {
-		if (!isContribution(raw)) {
+		if (!isTelemetryContribution(raw)) {
 			console.error("pi-telemetry: ignored invalid telemetry contribution");
 			return;
 		}
@@ -387,7 +245,7 @@ export default function telemetry(pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const scope = args.trim() || "session";
 			if (scope === "path") {
-				await show(ctx, [`Telemetry file`, telemetryPath(), "JSONL snapshots contain no prompts or tool output."]);
+				await show(ctx, ["Telemetry file", telemetryPath(), "JSONL snapshots contain no prompts or tool output."]);
 				return;
 			}
 			if (scope === "session") {
