@@ -3,10 +3,9 @@ import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-c
 import { matchesKey, truncateToWidth } from "@earendil-works/pi-tui";
 import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { isUsageRecord, recordTotals, recordsForDay, usageRecords, type UsageRecord } from "./ledger.ts";
 import {
-	addMetrics,
 	collectMetrics,
-	createUsageTotals,
 	isTelemetryContribution,
 	type SessionMetrics,
 	type TelemetryContribution,
@@ -36,7 +35,7 @@ type ContributionEvent = {
 	contribution: TelemetryContribution;
 };
 
-type StoredEvent = TelemetrySnapshot | ContributionEvent;
+type StoredEvent = TelemetrySnapshot | ContributionEvent | UsageRecord;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -53,6 +52,7 @@ function isMetrics(value: unknown): value is SessionMetrics {
 
 function isStoredEvent(value: unknown): value is StoredEvent {
 	if (!isRecord(value) || typeof value.schemaVersion !== "number" || typeof value.timestamp !== "string" || typeof value.sessionId !== "string") return false;
+	if (value.type === "usage_record") return isUsageRecord(value);
 	if (value.type === "contribution") return isTelemetryContribution(value.contribution);
 	return value.type === "session_snapshot" && typeof value.cwd === "string" && isMetrics(value.metrics);
 }
@@ -82,10 +82,26 @@ function snapshot(ctx: ExtensionContext): TelemetrySnapshot {
 }
 
 function persistSnapshot(ctx: ExtensionContext): void {
+	if (process.env.PI_TELEMETRY_DEFER_TO_PARENT === "1") return;
 	try {
 		appendEvent(snapshot(ctx));
 	} catch (error) {
 		console.error(`pi-telemetry: could not write ${telemetryPath()}: ${String(error)}`);
+	}
+}
+
+function persistUsage(ctx: ExtensionContext): void {
+	try {
+		const seen = new Set(readEvents().filter(isUsageRecord).map((row) => `${row.sessionId}/${row.entryId}`));
+		for (const record of usageRecords(ctx.sessionManager.getEntries(), ctx.sessionManager.getSessionId())) {
+			if (process.env.PI_TELEMETRY_DEFER_TO_PARENT === "1" && record.category !== "experiment") continue;
+			const key = `${record.sessionId}/${record.entryId}`;
+			if (seen.has(key)) continue;
+			appendEvent(record);
+			seen.add(key);
+		}
+	} catch (error) {
+		console.error(`pi-telemetry: could not write usage records: ${String(error)}`);
 	}
 }
 
@@ -115,48 +131,29 @@ function formatCost(value: number): string {
 	return `$${value.toFixed(value >= 1 ? 2 : 4)}`;
 }
 
-function metricsLines(title: string, metrics: SessionMetrics): string[] {
-	const { primary, experiments, total, agentDiet } = metrics;
+function usageLines(title: string, records: readonly UsageRecord[]): string[] {
+	const totals = recordTotals(records);
 	return [
 		title,
-		`Primary       in ${formatNumber(primary.input)}  out ${formatNumber(primary.output)}  cache ${formatNumber(primary.cacheRead + primary.cacheWrite)}  ${formatCost(primary.cost)}`,
-		`Experiments   in ${formatNumber(experiments.input)}  out ${formatNumber(experiments.output)}                         ${formatCost(experiments.cost)}`,
-		`Total         in ${formatNumber(total.input)}  out ${formatNumber(total.output)}  cache ${formatNumber(total.cacheRead + total.cacheWrite)}  ${formatCost(total.cost)}`,
-		`AgentDiet     ${agentDiet.events} events, ${formatNumber(agentDiet.savedInputTokens)} future input tokens removed, reflector ${formatCost(agentDiet.reflectorCost)}`,
+		`Primary       in ${formatNumber(totals.primary.input)}  out ${formatNumber(totals.primary.output)}  cache ${formatNumber(totals.primary.cacheRead + totals.primary.cacheWrite)}  ${formatCost(totals.primary.cost)}`,
+		`Subagents     in ${formatNumber(totals.subagents.input)}  out ${formatNumber(totals.subagents.output)}  cache ${formatNumber(totals.subagents.cacheRead + totals.subagents.cacheWrite)}  ${formatCost(totals.subagents.cost)}`,
+		`Experiments   in ${formatNumber(totals.experiments.input)}  out ${formatNumber(totals.experiments.output)}                         ${formatCost(totals.experiments.cost)}`,
+		`Total         in ${formatNumber(totals.total.input)}  out ${formatNumber(totals.total.output)}  cache ${formatNumber(totals.total.cacheRead + totals.total.cacheWrite)}  ${formatCost(totals.total.cost)}`,
+		`AgentDiet     ${formatNumber(totals.savedInputTokens)} future input tokens removed (not billed savings)`,
 	];
 }
 
-function aggregate(snapshots: readonly TelemetrySnapshot[]): SessionMetrics {
-	const primary = createUsageTotals();
-	const experiments = createUsageTotals();
-	let dietEvents = 0;
-	let dietSavedInputTokens = 0;
-	let dietReflectorCost = 0;
-	for (const snapshot of snapshots) {
-		for (const key of ["input", "output", "cacheRead", "cacheWrite", "cost"] as const) {
-			primary[key] += snapshot.metrics.primary[key];
-			experiments[key] += snapshot.metrics.experiments[key];
-		}
-		dietEvents += snapshot.metrics.agentDiet.events;
-		dietSavedInputTokens += snapshot.metrics.agentDiet.savedInputTokens;
-		dietReflectorCost += snapshot.metrics.agentDiet.reflectorCost;
+function breakdown(records: readonly UsageRecord[], key: "model" | "taskId"): string[] {
+	const groups = new Map<string, UsageRecord[]>();
+	for (const record of records) {
+		const name = key === "taskId" ? `${record.sessionId.slice(0, 8)}/${record.taskId}` : record.model;
+		groups.set(name, [...(groups.get(name) ?? []), record]);
 	}
-	return {
-		primary,
-		experiments,
-		total: addMetrics(primary, experiments),
-		agentDiet: { events: dietEvents, savedInputTokens: dietSavedInputTokens, reflectorCost: dietReflectorCost },
-	};
-}
-
-function latestSnapshots(events: readonly StoredEvent[], filter: (snapshot: TelemetrySnapshot) => boolean): TelemetrySnapshot[] {
-	const latest = new Map<string, TelemetrySnapshot>();
-	for (const event of events) {
-		if (event.type !== "session_snapshot" || !filter(event)) continue;
-		const previous = latest.get(event.sessionId);
-		if (!previous || previous.timestamp < event.timestamp) latest.set(event.sessionId, event);
-	}
-	return [...latest.values()].sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+	return [...groups.entries()]
+		.map(([name, items]) => ({ name, items, cost: recordTotals(items).total.cost }))
+		.sort((a, b) => b.cost - a.cost)
+		.slice(0, 15)
+		.map(({ name, items, cost }) => `${name}  ${formatCost(cost)}  ${formatNumber(recordTotals(items).total.input)} in / ${formatNumber(recordTotals(items).total.output)} out`);
 }
 
 function localDay(iso: string): string {
@@ -212,10 +209,12 @@ export default function telemetry(pi: ExtensionAPI) {
 	});
 
 	pi.on("agent_settled", (_event, ctx) => {
+		persistUsage(ctx);
 		persistSnapshot(ctx);
 	});
 
 	pi.on("session_shutdown", (_event, ctx) => {
+		persistUsage(ctx);
 		persistSnapshot(ctx);
 		currentSessionId = undefined;
 	});
@@ -241,27 +240,28 @@ export default function telemetry(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("telemetry", {
-		description: "Show locally stored Pi token and cost telemetry: session | today | all | path",
+		description: "Show Pi usage: session | today | all | models | tasks | path",
 		handler: async (args, ctx) => {
 			const scope = args.trim() || "session";
 			if (scope === "path") {
-				await show(ctx, ["Telemetry file", telemetryPath(), "JSONL snapshots contain no prompts or tool output."]);
+				await show(ctx, ["Telemetry file", telemetryPath(), "JSONL records contain no prompts or tool output."]);
 				return;
 			}
-			if (scope === "session") {
-				await show(ctx, [...metricsLines(`Session ${ctx.sessionManager.getSessionId().slice(0, 8)}`, collectMetrics(ctx.sessionManager.getBranch())), "Esc, Enter, or q closes this view."]);
+			if (!["session", "today", "all", "models", "tasks"].includes(scope)) {
+				ctx.ui.notify("Usage: /telemetry [session|today|all|models|tasks|path]", "error");
 				return;
 			}
-			if (scope !== "today" && scope !== "all") {
-				ctx.ui.notify("Usage: /telemetry [session|today|all|path]", "error");
-				return;
-			}
-
+			persistUsage(ctx);
 			const today = localDay(new Date().toISOString());
-			const snapshots = latestSnapshots(readEvents(), (item) => scope === "all" || localDay(item.timestamp) === today);
-			const lines = metricsLines(`${scope === "today" ? `Today ${today}` : "All recorded sessions"} (${snapshots.length} sessions)`, aggregate(snapshots));
+			const stored = readEvents().filter(isUsageRecord);
+			const records = scope === "all" ? stored : scope === "session"
+				? stored.filter((item) => item.sessionId === ctx.sessionManager.getSessionId())
+				: recordsForDay(stored, new Date());
+			const lines = scope === "models" || scope === "tasks"
+				? [`${scope === "models" ? "Models" : "Tasks"} today ${today}`, ...breakdown(records, scope === "models" ? "model" : "taskId")]
+				: usageLines(scope === "session" ? `Session ${ctx.sessionManager.getSessionId().slice(0, 8)}` : scope === "today" ? `Today ${today}` : "All recorded usage", records);
+			lines.push("Only scanned sessions appear here. Reopen an older session to backfill its recorded usage.");
 			lines.push(`File: ${telemetryPath()}`);
-			lines.push("Esc, Enter, or q closes this view.");
 			await show(ctx, lines);
 		},
 	});

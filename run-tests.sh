@@ -7,11 +7,11 @@ trap 'rm -rf "$out"' EXIT
 
 mkdir -p "$out/node_modules/@earendil-works/pi-coding-agent" "$out/node_modules/@earendil-works/pi-tui"
 printf '{"type":"module"}\n' > "$out/package.json"
-printf 'export function getAgentDir() { return "/tmp/pi-agent"; }\n' > "$out/node_modules/@earendil-works/pi-coding-agent/index.js"
+printf 'export function getAgentDir() { return process.env.PI_TELEMETRY_TEST_DIR; }\n' > "$out/node_modules/@earendil-works/pi-coding-agent/index.js"
 printf '{"name":"@earendil-works/pi-coding-agent","type":"module","main":"index.js"}\n' > "$out/node_modules/@earendil-works/pi-coding-agent/package.json"
 printf 'export function matchesKey() { return false; }\nexport function truncateToWidth(value) { return value; }\nexport function visibleWidth(value) { return value.length; }\n' > "$out/node_modules/@earendil-works/pi-tui/index.js"
 printf '{"name":"@earendil-works/pi-tui","type":"module","main":"index.js"}\n' > "$out/node_modules/@earendil-works/pi-tui/package.json"
-cp "$here/index.ts" "$here/metrics.ts" "$here/test.mjs" "$out/"
+cp "$here/index.ts" "$here/metrics.ts" "$here/ledger.ts" "$here/test.mjs" "$out/"
 
 global_node_modules="$(npm root -g 2>/dev/null || true)"
 pi_pkg="${PI_CODING_AGENT_PACKAGE_DIR:-$global_node_modules/@earendil-works/pi-coding-agent}"
@@ -45,11 +45,11 @@ EOF
       "@earendil-works/pi-tui": ["$pi_pkg/node_modules/@earendil-works/pi-tui/dist/index.d.ts"]
     }
   },
-  "files": ["$out/node-stub.d.ts", "$out/metrics.ts", "$out/index.ts"]
+  "files": ["$out/node-stub.d.ts", "$out/metrics.ts", "$out/ledger.ts", "$out/index.ts"]
 }
 EOF
   "$tsc" -p "$out/tsconfig.json"
   echo "typecheck clean"
 fi
 
-cd "$out" && node test.mjs
+cd "$out" && PI_TELEMETRY_TEST_DIR="$out" node test.mjs

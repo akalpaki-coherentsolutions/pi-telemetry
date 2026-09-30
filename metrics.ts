@@ -111,6 +111,10 @@ export function collectMetrics(entries: readonly SessionEntry[]): SessionMetrics
 			addUsage(primary, entry.message.usage);
 			continue;
 		}
+		if (entry.type === "message" && entry.message.role === "toolResult") {
+			addUsage(primary, entry.message.usage);
+			continue;
+		}
 		if (entry.type === "usage") {
 			addUsage(primary, entry.usage);
 			continue;
